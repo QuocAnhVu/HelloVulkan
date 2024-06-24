@@ -91,9 +91,11 @@ void DestroyDebugUtilsMessengerEXT(VkInstance instance,
 struct QueueFamilyIndices {
   std::optional<uint32_t> graphicsFamily;
   std::optional<uint32_t> presentFamily;
+  std::optional<uint32_t> transferFamily;
 
   bool isComplete() {
-    return graphicsFamily.has_value() && presentFamily.has_value();
+    return graphicsFamily.has_value() && presentFamily.has_value() &&
+           transferFamily.has_value();
   }
 };
 
@@ -177,10 +179,12 @@ private:
   VkPipelineLayout pipelineLayout;
   VkPipeline graphicsPipeline;
   std::vector<VkFramebuffer> swapChainFramebuffers;
-  VkCommandPool commandPool;
+  VkCommandPool graphicsCommandPool;
+  VkCommandPool transferCommandPool;
   VkBuffer vertexBuffer;
   VkDeviceMemory vertexBufferMemory;
-  std::vector<VkCommandBuffer> commandBuffers;
+  std::vector<VkCommandBuffer> graphicsCommandBuffers;
+  VkCommandBuffer transferCommandBuffer;
   std::vector<VkSemaphore> imageAvailableSemaphores;
   std::vector<VkSemaphore> renderFinishedSemaphores;
   std::vector<VkFence> inFlightFences;
@@ -241,7 +245,8 @@ private:
       vkDestroyFence(device, inFlightFences[i], nullptr);
     }
 
-    vkDestroyCommandPool(device, commandPool, nullptr);
+    vkDestroyCommandPool(device, graphicsCommandPool, nullptr);
+    vkDestroyCommandPool(device, transferCommandPool, nullptr);
 
     vkDestroyPipeline(device, graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -432,12 +437,12 @@ private:
 
   void createLogicalDevice() {
     QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
-
-    std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-    std::set<uint32_t> uniqueQueueFamilies = {indices.graphicsFamily.value(),
-                                              indices.presentFamily.value()};
+    std::set<uint32_t> uniqueQueueFamilies({indices.graphicsFamily.value(),
+                                            indices.presentFamily.value(),
+                                            indices.transferFamily.value()});
 
     float queuePriority = 1.0f;
+    std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
     for (uint32_t queueFamily : uniqueQueueFamilies) {
       VkDeviceQueueCreateInfo queueCreateInfo{};
       queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -485,13 +490,19 @@ private:
 
     int i = 0;
     for (const auto &queueFamily : queueFamilies) {
-      if (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-        indices.graphicsFamily = i;
-      }
-      VkBool32 presentSupport = false;
-      vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, &presentSupport);
-      if (presentSupport) {
-        indices.presentFamily = i;
+      if ((~queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+          (queueFamily.queueFlags & VK_QUEUE_TRANSFER_BIT)) {
+        indices.transferFamily = i;
+      } else {
+        if (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+          indices.graphicsFamily = i;
+        }
+        VkBool32 presentSupport = false;
+        vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface,
+                                             &presentSupport);
+        if (presentSupport) {
+          indices.presentFamily = i;
+        }
       }
       if (indices.isComplete()) {
         break;
@@ -887,12 +898,23 @@ private:
   void createCommandPool() {
     QueueFamilyIndices queueFamilyIndices = findQueueFamilies(physicalDevice);
 
-    VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily.value();
-    if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) !=
-        VK_SUCCESS) {
+    VkCommandPoolCreateInfo graphicsPoolInfo{};
+    graphicsPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    graphicsPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    graphicsPoolInfo.queueFamilyIndex =
+        queueFamilyIndices.graphicsFamily.value();
+    if (vkCreateCommandPool(device, &graphicsPoolInfo, nullptr,
+                            &graphicsCommandPool) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to create command pool!");
+    }
+
+    VkCommandPoolCreateInfo transferPoolInfo{};
+    transferPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    transferPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    transferPoolInfo.queueFamilyIndex =
+        queueFamilyIndices.transferFamily.value();
+    if (vkCreateCommandPool(device, &transferPoolInfo, nullptr,
+                            &transferCommandPool) != VK_SUCCESS) {
       throw std::runtime_error("Failed to create command pool!");
     }
   }
@@ -902,7 +924,16 @@ private:
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = sizeof(vertices[0]) * vertices.size();
     bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bufferInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    QueueFamilyIndices queueFamilyIndices = findQueueFamilies(physicalDevice);
+    std::set<uint32_t> uniqueQueueFamilies(
+        {queueFamilyIndices.graphicsFamily.value(),
+         queueFamilyIndices.presentFamily.value(),
+         queueFamilyIndices.transferFamily.value()});
+    std::vector<uint32_t> queueFamilies(uniqueQueueFamilies.begin(),
+                                        uniqueQueueFamilies.end());
+    bufferInfo.queueFamilyIndexCount = queueFamilies.size();
+    bufferInfo.pQueueFamilyIndices = queueFamilies.data();
     if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) !=
         VK_SUCCESS) {
       throw std::runtime_error("Failed to create vertex buffer!");
@@ -945,15 +976,28 @@ private:
   }
 
   void createCommandBuffers() {
-    commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+    graphicsCommandBuffers.resize(MAX_FRAMES_IN_FLIGHT + 1);
 
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = (uint32_t)commandBuffers.size();
-    if (vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()) !=
-        VK_SUCCESS) {
+    VkCommandBufferAllocateInfo graphicsBufferAllocInfo{};
+    graphicsBufferAllocInfo.sType =
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    graphicsBufferAllocInfo.commandPool = graphicsCommandPool;
+    graphicsBufferAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    graphicsBufferAllocInfo.commandBufferCount =
+        (uint32_t)graphicsCommandBuffers.size();
+    if (vkAllocateCommandBuffers(device, &graphicsBufferAllocInfo,
+                                 graphicsCommandBuffers.data()) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to allocate command buffers!");
+    }
+
+    VkCommandBufferAllocateInfo transferBufferAllocInfo{};
+    transferBufferAllocInfo.sType =
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    transferBufferAllocInfo.commandPool = transferCommandPool;
+    transferBufferAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    transferBufferAllocInfo.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device, &transferBufferAllocInfo,
+                                 &transferCommandBuffer) != VK_SUCCESS) {
       throw std::runtime_error("Failed to allocate command buffers!");
     }
   }
@@ -997,8 +1041,8 @@ private:
 
     vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
-    vkResetCommandBuffer(commandBuffers[currentFrame], 0);
-    recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
+    vkResetCommandBuffer(graphicsCommandBuffers[currentFrame], 0);
+    recordCommandBuffer(graphicsCommandBuffers[currentFrame], imageIndex);
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1010,7 +1054,7 @@ private:
     submitInfo.pWaitSemaphores = waitSemaphores;
     submitInfo.pWaitDstStageMask = waitStages;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffers[currentFrame];
+    submitInfo.pCommandBuffers = &graphicsCommandBuffers[currentFrame];
 
     VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[currentFrame]};
     submitInfo.signalSemaphoreCount = 1;
