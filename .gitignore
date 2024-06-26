@@ -1,2 +1,5 @@
 VulkanTest
 shaders/*.spv
+*.h
+textures/
+models/
